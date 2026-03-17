@@ -2,20 +2,26 @@
 
 from __future__ import annotations
 
-import asyncio
+import hashlib
 import json
-import weakref
+import math
+import re
+import sqlite3
+import struct
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Callable
+from typing import TYPE_CHECKING, Any
+
+import numpy as np
+import sqlite_vec
 
 from loguru import logger
 
-from nanobot.utils.helpers import ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain
+from nanobot.utils.helpers import ensure_dir
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
-    from nanobot.session.manager import Session, SessionManager
+    from nanobot.session.manager import Session
 
 
 _SAVE_MEMORY_TOOL = [
@@ -29,7 +35,7 @@ _SAVE_MEMORY_TOOL = [
                 "properties": {
                     "history_entry": {
                         "type": "string",
-                        "description": "A paragraph summarizing key events/decisions/topics. "
+                        "description": "A paragraph (2-5 sentences) summarizing key events/decisions/topics. "
                         "Start with [YYYY-MM-DD HH:MM]. Include detail useful for grep search.",
                     },
                     "memory_update": {
@@ -45,43 +51,227 @@ _SAVE_MEMORY_TOOL = [
 ]
 
 
-def _ensure_text(value: Any) -> str:
-    """Normalize tool-call payload values to text for file storage."""
-    return value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-
-
-def _normalize_save_memory_args(args: Any) -> dict[str, Any] | None:
-    """Normalize provider tool-call arguments to the expected dict shape."""
-    if isinstance(args, str):
-        args = json.loads(args)
-    if isinstance(args, list):
-        return args[0] if args and isinstance(args[0], dict) else None
-    return args if isinstance(args, dict) else None
-
-_TOOL_CHOICE_ERROR_MARKERS = (
-    "tool_choice",
-    "toolchoice",
-    "does not support",
-    'should be ["none", "auto"]',
-)
-
-
-def _is_tool_choice_unsupported(content: str | None) -> bool:
-    """Detect provider errors caused by forced tool_choice being unsupported."""
-    text = (content or "").lower()
-    return any(m in text for m in _TOOL_CHOICE_ERROR_MARKERS)
-
-
 class MemoryStore:
-    """Two-layer memory: MEMORY.md (long-term facts) + HISTORY.md (grep-searchable log)."""
+    """Persistent memory store: markdown memory + history log + lightweight structured sqlite."""
 
-    _MAX_FAILURES_BEFORE_RAW_ARCHIVE = 3
+    _EMBED_DIM = 1536  # OpenAI text-embedding-3-small dimension
 
-    def __init__(self, workspace: Path):
+    def __init__(self, workspace: Path, config: dict[str, Any] | None = None):
         self.memory_dir = ensure_dir(workspace / "memory")
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "HISTORY.md"
-        self._consecutive_failures = 0
+        self.db_file = self.memory_dir / "memory.db"
+        self.config = config or {}
+        self._embedding_cache: dict[str, list[float]] = {}
+        # Try to load embedding config from nanobot config if not provided
+        if not self.config.get("embedding"):
+            try:
+                from nanobot.config.loader import load_config
+                cfg = load_config()
+                if hasattr(cfg, "model_dump"):
+                    cfg_dict = cfg.model_dump()
+                else:
+                    cfg_dict = dict(cfg) if cfg else {}
+                self.config = cfg_dict
+            except Exception:
+                pass
+        self._init_db()
+
+    def _get_embedding_config(self) -> dict[str, Any]:
+        """Get embedding configuration from config."""
+        emb = self.config.get("embedding", {})
+        # Support both camelCase and snake_case
+        api_key = emb.get("apiKey") or emb.get("api_key", "")
+        api_base = emb.get("apiBase") or emb.get("api_base", "https://api.openai.com/v1")
+        model = emb.get("model", "text-embedding-3-small")
+        provider = emb.get("provider", "openai")
+        
+        if api_key:
+            return {
+                "provider": provider,
+                "model": model,
+                "apiKey": api_key,
+                "apiBase": api_base.rstrip("/"),
+            }
+        return {}
+
+    async def _embed_text_async(self, text: str) -> list[float]:
+        """Get embedding for text using configured API or fallback to hash."""
+        if text in self._embedding_cache:
+            return self._embedding_cache[text]
+
+        emb_config = self._get_embedding_config()
+
+        if emb_config and emb_config.get("apiKey"):
+            try:
+                import aiohttp
+                api_key = emb_config["apiKey"]
+                api_base = emb_config.get("apiBase", "https://api.openai.com/v1").rstrip("/")
+                model = emb_config.get("model", "text-embedding-3-small")
+
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        f"{api_base}/embeddings",
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={"input": text, "model": model},
+                        timeout=aiohttp.ClientTimeout(total=30),
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            embedding = data["data"][0]["embedding"]
+                            self._embedding_cache[text] = embedding
+                            return embedding
+                        else:
+                            logger.warning("Embedding API error: status {}", resp.status)
+            except Exception as e:
+                logger.warning("Embedding API failed: {}", e)
+
+        # Fallback to hash embedding
+        return self._embed_text_hash(text)
+
+    def _embed_text_hash(self, text: str) -> list[float]:
+        """Fallback hash-based embedding when API is not available."""
+        vec = np.zeros(self._EMBED_DIM, dtype=np.float32)
+        for token in self._tokenize(text):
+            h = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+            idx = int.from_bytes(h[:4], "little") % self._EMBED_DIM
+            sign = 1.0 if (h[4] % 2 == 0) else -1.0
+            weight = 1.0 + (h[5] / 255.0) * 0.25
+            vec[idx] += sign * weight
+        norm = float(np.linalg.norm(vec))
+        if norm > 0:
+            vec /= norm
+        return vec.astype(float).tolist()
+
+    def _connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(self.db_file)
+        conn.row_factory = sqlite3.Row
+        conn.enable_load_extension(True)
+        sqlite_vec.load(conn)
+        conn.enable_load_extension(False)
+        return conn
+
+    def _init_db(self) -> None:
+        with self._connect() as conn:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS facts (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    key TEXT NOT NULL,
+                    value TEXT NOT NULL,
+                    scope TEXT NOT NULL DEFAULT 'long_term',
+                    status TEXT NOT NULL DEFAULT 'active',
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    source TEXT NOT NULL DEFAULT 'manual',
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(key, scope)
+                );
+
+                CREATE TABLE IF NOT EXISTS principles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    key TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    confidence REAL NOT NULL DEFAULT 1.0,
+                    source TEXT NOT NULL DEFAULT 'manual',
+                    updated_at TEXT NOT NULL,
+                    UNIQUE(key)
+                );
+
+                CREATE TABLE IF NOT EXISTS episodes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_key TEXT NOT NULL,
+                    ts TEXT NOT NULL,
+                    topic TEXT NOT NULL DEFAULT '',
+                    user_text TEXT NOT NULL,
+                    assistant_text TEXT NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'conversation',
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                );
+
+                CREATE TABLE IF NOT EXISTS style_feedback (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts TEXT NOT NULL,
+                    session_key TEXT NOT NULL,
+                    signal TEXT NOT NULL,
+                    polarity TEXT NOT NULL,
+                    evidence TEXT NOT NULL,
+                    topic TEXT NOT NULL DEFAULT '',
+                    source TEXT NOT NULL DEFAULT 'conversation',
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                );
+
+                CREATE TABLE IF NOT EXISTS semantic_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    memory_type TEXT NOT NULL,
+                    ref_id INTEGER NOT NULL,
+                    session_key TEXT NOT NULL DEFAULT '',
+                    topic TEXT NOT NULL DEFAULT '',
+                    text_content TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_episodes_session_ts ON episodes(session_key, ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_episodes_topic_ts ON episodes(topic, ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_style_feedback_topic_ts ON style_feedback(topic, ts DESC);
+                CREATE INDEX IF NOT EXISTS idx_semantic_memory_type_ref ON semantic_memory(memory_type, ref_id);
+                CREATE INDEX IF NOT EXISTS idx_semantic_memory_session_topic ON semantic_memory(session_key, topic);
+                """
+            )
+            # Create sqlite-vec virtual table for embeddings (cosine distance)
+            try:
+                conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS semantic_embeddings USING vec0(embedding float[1536] distance_metric=cosine)")
+            except Exception as e:
+                logger.warning("Could not create sqlite-vec table (may already exist): {}", e)
+            conn.commit()
+
+    def _tokenize(self, text: str) -> list[str]:
+        text = (text or "").lower()
+        ascii_tokens = re.findall(r"[a-z0-9_]+", text)
+        cjk_chunks = re.findall(r"[\u4e00-\u9fff]{1,8}", text)
+        cjk_bigrams: list[str] = []
+        for chunk in cjk_chunks:
+            if len(chunk) == 1:
+                cjk_bigrams.append(chunk)
+            else:
+                cjk_bigrams.extend(chunk[i:i+2] for i in range(len(chunk) - 1))
+        return ascii_tokens + cjk_bigrams
+
+    def _serialize_f32(self, vector: list[float]) -> bytes:
+        """Serialize a list of floats into compact bytes for sqlite-vec."""
+        return struct.pack(f"{len(vector)}f", *vector)
+
+    async def _insert_semantic_memory(
+        self,
+        memory_type: str,
+        ref_id: int,
+        text_content: str,
+        *,
+        session_key: str = "",
+        topic: str = "",
+        created_at: str | None = None,
+    ) -> None:
+        created_at = created_at or datetime.now().isoformat()
+        embedding = await self._embed_text_async(text_content)
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO semantic_memory (memory_type, ref_id, session_key, topic, text_content, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (memory_type, ref_id, session_key, topic, text_content, created_at),
+            )
+            row_id = cursor.lastrowid
+            # Insert embedding into sqlite-vec virtual table
+            embedding_blob = self._serialize_f32(embedding)
+            conn.execute(
+                "INSERT INTO semantic_embeddings(rowid, embedding) VALUES (?, ?)",
+                (row_id, embedding_blob),
+            )
+            conn.commit()
 
     def read_long_term(self) -> str:
         if self.memory_file.exists():
@@ -99,27 +289,339 @@ class MemoryStore:
         long_term = self.read_long_term()
         return f"## Long-term Memory\n{long_term}" if long_term else ""
 
-    @staticmethod
-    def _format_messages(messages: list[dict]) -> str:
-        lines = []
-        for message in messages:
-            if not message.get("content"):
-                continue
-            tools = f" [tools: {', '.join(message['tools_used'])}]" if message.get("tools_used") else ""
-            lines.append(
-                f"[{message.get('timestamp', '?')[:16]}] {message['role'].upper()}{tools}: {message['content']}"
+    def upsert_fact(
+        self,
+        key: str,
+        value: str,
+        *,
+        scope: str = "long_term",
+        status: str = "active",
+        confidence: float = 1.0,
+        source: str = "manual",
+    ) -> None:
+        now = datetime.now().isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO facts (key, value, scope, status, confidence, source, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(key, scope) DO UPDATE SET
+                    value=excluded.value,
+                    status=excluded.status,
+                    confidence=excluded.confidence,
+                    source=excluded.source,
+                    updated_at=excluded.updated_at
+                """,
+                (key, value, scope, status, confidence, source, now),
             )
-        return "\n".join(lines)
+            conn.commit()
+
+    def upsert_principle(
+        self,
+        key: str,
+        content: str,
+        *,
+        status: str = "active",
+        confidence: float = 1.0,
+        source: str = "manual",
+    ) -> None:
+        now = datetime.now().isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO principles (key, content, status, confidence, source, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    content=excluded.content,
+                    status=excluded.status,
+                    confidence=excluded.confidence,
+                    source=excluded.source,
+                    updated_at=excluded.updated_at
+                """,
+                (key, content, status, confidence, source, now),
+            )
+            conn.commit()
+
+    async def record_episode(
+        self,
+        session_key: str,
+        user_text: str,
+        assistant_text: str,
+        *,
+        topic: str = "",
+        source: str = "conversation",
+        metadata: dict[str, Any] | None = None,
+        ts: str | None = None,
+    ) -> None:
+        metadata = metadata or {}
+        ts = ts or datetime.now().isoformat()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO episodes (session_key, ts, topic, user_text, assistant_text, source, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (session_key, ts, topic, user_text, assistant_text, source, json.dumps(metadata, ensure_ascii=False)),
+            )
+            ref_id = int(cursor.lastrowid)
+            conn.commit()
+        semantic_text = f"topic: {topic}\nuser: {user_text}\nassistant: {assistant_text}"
+        await self._insert_semantic_memory(
+            "episode",
+            ref_id,
+            semantic_text,
+            session_key=session_key,
+            topic=topic,
+            created_at=ts,
+        )
+
+    async def record_style_feedback(
+        self,
+        session_key: str,
+        signal: str,
+        polarity: str,
+        evidence: str,
+        *,
+        topic: str = "",
+        source: str = "conversation",
+        metadata: dict[str, Any] | None = None,
+        ts: str | None = None,
+    ) -> None:
+        metadata = metadata or {}
+        ts = ts or datetime.now().isoformat()
+        with self._connect() as conn:
+            cursor = conn.execute(
+                """
+                INSERT INTO style_feedback (ts, session_key, signal, polarity, evidence, topic, source, metadata_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (ts, session_key, signal, polarity, evidence, topic, source, json.dumps(metadata, ensure_ascii=False)),
+            )
+            ref_id = int(cursor.lastrowid)
+            conn.commit()
+        semantic_text = f"topic: {topic}\nsignal: {signal}\npolarity: {polarity}\nevidence: {evidence}"
+        await self._insert_semantic_memory(
+            "style_feedback",
+            ref_id,
+            semantic_text,
+            session_key=session_key,
+            topic=topic,
+            created_at=ts,
+        )
+
+    def get_active_principles(self, limit: int = 8) -> list[dict[str, Any]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT key, content, confidence, source, updated_at
+                FROM principles
+                WHERE status = 'active'
+                ORDER BY updated_at DESC, confidence DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_recent_style_feedback(
+        self,
+        *,
+        session_key: str | None = None,
+        topic: str = "",
+        limit: int = 6,
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if session_key:
+            clauses.append("session_key = ?")
+            params.append(session_key)
+        if topic:
+            clauses.append("topic = ?")
+            params.append(topic)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        query = f"""
+            SELECT ts, session_key, signal, polarity, evidence, topic, metadata_json
+            FROM style_feedback
+            {where}
+            ORDER BY ts DESC
+            LIMIT ?
+        """
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_recent_episodes(
+        self,
+        *,
+        session_key: str | None = None,
+        topic: str = "",
+        limit: int = 4,
+    ) -> list[dict[str, Any]]:
+        clauses = []
+        params: list[Any] = []
+        if session_key:
+            clauses.append("session_key = ?")
+            params.append(session_key)
+        if topic:
+            clauses.append("topic = ?")
+            params.append(topic)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        query = f"""
+            SELECT ts, session_key, topic, user_text, assistant_text, metadata_json
+            FROM episodes
+            {where}
+            ORDER BY ts DESC
+            LIMIT ?
+        """
+        params.append(limit)
+        with self._connect() as conn:
+            rows = conn.execute(query, params).fetchall()
+        return [dict(row) for row in rows]
+
+    async def semantic_search(
+        self,
+        query_text: str,
+        *,
+        memory_types: tuple[str, ...] = ("episode", "style_feedback"),
+        session_key: str | None = None,
+        topic: str = "",
+        limit: int = 4,
+        min_score: float = 0.18,
+    ) -> list[dict[str, Any]]:
+        query_embedding = await self._embed_text_async(query_text)
+        query_blob = self._serialize_f32(query_embedding)
+
+        # sqlite-vec requires k parameter for MATCH queries
+        k = limit * 2
+
+        # Build filter conditions for semantic_memory table
+        filter_clauses = []
+        filter_params: list[Any] = []
+        if memory_types:
+            placeholders = ",".join("?" for _ in memory_types)
+            filter_clauses.append(f"memory_type IN ({placeholders})")
+            filter_params.extend(memory_types)
+        if session_key:
+            filter_clauses.append("session_key = ?")
+            filter_params.append(session_key)
+        if topic:
+            filter_clauses.append("topic = ?")
+            filter_params.append(topic)
+
+        # First, get vector search results from sqlite-vec
+        vec_query = """
+            SELECT rowid, distance
+            FROM semantic_embeddings
+            WHERE embedding MATCH ? AND k = ?
+            ORDER BY distance
+        """
+        vec_params = [query_blob, k]
+
+        with self._connect() as conn:
+            vec_results = conn.execute(vec_query, vec_params).fetchall()
+
+        if not vec_results:
+            return []
+
+        # Then, get corresponding semantic_memory records
+        row_ids = [r[0] for r in vec_results]
+        id_placeholders = ",".join("?" for _ in row_ids)
+        mem_query = f"""
+            SELECT id, memory_type, ref_id, session_key, topic, text_content, created_at
+            FROM semantic_memory
+            WHERE id IN ({id_placeholders})
+        """
+        if filter_clauses:
+            mem_query += f" AND {' AND '.join(filter_clauses)}"
+        mem_params = row_ids + filter_params
+
+        mem_rows = conn.execute(mem_query, mem_params).fetchall()
+
+        # Build lookup by id
+        mem_by_id = {row[0]: dict(row) for row in mem_rows}
+
+        # Combine results
+        scored: list[dict[str, Any]] = []
+        seen: set[tuple[str, int]] = set()
+        for rowid, distance in vec_results:
+            if rowid not in mem_by_id:
+                continue
+            item = mem_by_id[rowid]
+            key = (item.get("memory_type", ""), int(item.get("ref_id", 0)))
+            if key in seen:
+                continue
+            seen.add(key)
+            # Convert distance to similarity score (cosine distance = 1 - cosine similarity)
+            score = 1.0 - distance
+            if score < min_score:
+                continue
+            item["score"] = score
+            scored.append(item)
+
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        return scored[:limit]
+
+    def debug_summary(self) -> dict[str, Any]:
+        with self._connect() as conn:
+            counts = {
+                "facts": conn.execute("SELECT COUNT(*) FROM facts").fetchone()[0],
+                "principles": conn.execute("SELECT COUNT(*) FROM principles").fetchone()[0],
+                "episodes": conn.execute("SELECT COUNT(*) FROM episodes").fetchone()[0],
+                "style_feedback": conn.execute("SELECT COUNT(*) FROM style_feedback").fetchone()[0],
+                "semantic_memory": conn.execute("SELECT COUNT(*) FROM semantic_memory").fetchone()[0],
+            }
+            recent_principles = [dict(r) for r in conn.execute(
+                "SELECT key, content, updated_at FROM principles ORDER BY updated_at DESC LIMIT 5"
+            ).fetchall()]
+            recent_feedback = [dict(r) for r in conn.execute(
+                "SELECT ts, signal, polarity, evidence, topic FROM style_feedback ORDER BY ts DESC LIMIT 5"
+            ).fetchall()]
+            recent_episodes = [dict(r) for r in conn.execute(
+                "SELECT ts, topic, user_text, assistant_text FROM episodes ORDER BY ts DESC LIMIT 5"
+            ).fetchall()]
+        return {
+            "db_file": str(self.db_file),
+            "counts": counts,
+            "recent_principles": recent_principles,
+            "recent_feedback": recent_feedback,
+            "recent_episodes": recent_episodes,
+        }
 
     async def consolidate(
         self,
-        messages: list[dict],
+        session: Session,
         provider: LLMProvider,
         model: str,
+        *,
+        archive_all: bool = False,
+        memory_window: int = 50,
     ) -> bool:
-        """Consolidate the provided message chunk into MEMORY.md + HISTORY.md."""
-        if not messages:
-            return True
+        """Consolidate old messages into MEMORY.md + HISTORY.md via LLM tool call.
+
+        Returns True on success (including no-op), False on failure.
+        """
+        if archive_all:
+            old_messages = session.messages
+            keep_count = 0
+            logger.info("Memory consolidation (archive_all): {} messages", len(session.messages))
+        else:
+            keep_count = memory_window // 2
+            if len(session.messages) <= keep_count:
+                return True
+            if len(session.messages) - session.last_consolidated <= 0:
+                return True
+            old_messages = session.messages[session.last_consolidated:-keep_count]
+            if not old_messages:
+                return True
+            logger.info("Memory consolidation: {} to consolidate, {} keep", len(old_messages), keep_count)
+
+        lines = []
+        for m in old_messages:
+            if not m.get("content"):
+                continue
+            tools = f" [tools: {', '.join(m['tools_used'])}]" if m.get("tools_used") else ""
+            lines.append(f"[{m.get('timestamp', '?')[:16]}] {m['role'].upper()}{tools}: {m['content']}")
 
         current_memory = self.read_long_term()
         prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
@@ -128,230 +630,43 @@ class MemoryStore:
 {current_memory or "(empty)"}
 
 ## Conversation to Process
-{self._format_messages(messages)}"""
-
-        chat_messages = [
-            {"role": "system", "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."},
-            {"role": "user", "content": prompt},
-        ]
+{chr(10).join(lines)}"""
 
         try:
-            forced = {"type": "function", "function": {"name": "save_memory"}}
-            response = await provider.chat_with_retry(
-                messages=chat_messages,
+            response = await provider.chat(
+                messages=[
+                    {"role": "system", "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."},
+                    {"role": "user", "content": prompt},
+                ],
                 tools=_SAVE_MEMORY_TOOL,
                 model=model,
-                tool_choice=forced,
             )
 
-            if response.finish_reason == "error" and _is_tool_choice_unsupported(
-                response.content
-            ):
-                logger.warning("Forced tool_choice unsupported, retrying with auto")
-                response = await provider.chat_with_retry(
-                    messages=chat_messages,
-                    tools=_SAVE_MEMORY_TOOL,
-                    model=model,
-                    tool_choice="auto",
-                )
-
             if not response.has_tool_calls:
-                logger.warning(
-                    "Memory consolidation: LLM did not call save_memory "
-                    "(finish_reason={}, content_len={}, content_preview={})",
-                    response.finish_reason,
-                    len(response.content or ""),
-                    (response.content or "")[:200],
-                )
-                return self._fail_or_raw_archive(messages)
+                logger.warning("Memory consolidation: LLM did not call save_memory, skipping")
+                return False
 
-            args = _normalize_save_memory_args(response.tool_calls[0].arguments)
-            if args is None:
-                logger.warning("Memory consolidation: unexpected save_memory arguments")
-                return self._fail_or_raw_archive(messages)
+            args = response.tool_calls[0].arguments
+            # Some providers return arguments as a JSON string instead of dict
+            if isinstance(args, str):
+                args = json.loads(args)
+            if not isinstance(args, dict):
+                logger.warning("Memory consolidation: unexpected arguments type {}", type(args).__name__)
+                return False
 
-            if "history_entry" not in args or "memory_update" not in args:
-                logger.warning("Memory consolidation: save_memory payload missing required fields")
-                return self._fail_or_raw_archive(messages)
+            if entry := args.get("history_entry"):
+                if not isinstance(entry, str):
+                    entry = json.dumps(entry, ensure_ascii=False)
+                self.append_history(entry)
+            if update := args.get("memory_update"):
+                if not isinstance(update, str):
+                    update = json.dumps(update, ensure_ascii=False)
+                if update != current_memory:
+                    self.write_long_term(update)
 
-            entry = args["history_entry"]
-            update = args["memory_update"]
-
-            if entry is None or update is None:
-                logger.warning("Memory consolidation: save_memory payload contains null required fields")
-                return self._fail_or_raw_archive(messages)
-
-            entry = _ensure_text(entry).strip()
-            if not entry:
-                logger.warning("Memory consolidation: history_entry is empty after normalization")
-                return self._fail_or_raw_archive(messages)
-
-            self.append_history(entry)
-            update = _ensure_text(update)
-            if update != current_memory:
-                self.write_long_term(update)
-
-            self._consecutive_failures = 0
-            logger.info("Memory consolidation done for {} messages", len(messages))
+            session.last_consolidated = 0 if archive_all else len(session.messages) - keep_count
+            logger.info("Memory consolidation done: {} messages, last_consolidated={}", len(session.messages), session.last_consolidated)
             return True
         except Exception:
             logger.exception("Memory consolidation failed")
-            return self._fail_or_raw_archive(messages)
-
-    def _fail_or_raw_archive(self, messages: list[dict]) -> bool:
-        """Increment failure count; after threshold, raw-archive messages and return True."""
-        self._consecutive_failures += 1
-        if self._consecutive_failures < self._MAX_FAILURES_BEFORE_RAW_ARCHIVE:
             return False
-        self._raw_archive(messages)
-        self._consecutive_failures = 0
-        return True
-
-    def _raw_archive(self, messages: list[dict]) -> None:
-        """Fallback: dump raw messages to HISTORY.md without LLM summarization."""
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-        self.append_history(
-            f"[{ts}] [RAW] {len(messages)} messages\n"
-            f"{self._format_messages(messages)}"
-        )
-        logger.warning(
-            "Memory consolidation degraded: raw-archived {} messages", len(messages)
-        )
-
-
-class MemoryConsolidator:
-    """Owns consolidation policy, locking, and session offset updates."""
-
-    _MAX_CONSOLIDATION_ROUNDS = 5
-
-    def __init__(
-        self,
-        workspace: Path,
-        provider: LLMProvider,
-        model: str,
-        sessions: SessionManager,
-        context_window_tokens: int,
-        build_messages: Callable[..., list[dict[str, Any]]],
-        get_tool_definitions: Callable[[], list[dict[str, Any]]],
-    ):
-        self.store = MemoryStore(workspace)
-        self.provider = provider
-        self.model = model
-        self.sessions = sessions
-        self.context_window_tokens = context_window_tokens
-        self._build_messages = build_messages
-        self._get_tool_definitions = get_tool_definitions
-        self._locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
-
-    def get_lock(self, session_key: str) -> asyncio.Lock:
-        """Return the shared consolidation lock for one session."""
-        return self._locks.setdefault(session_key, asyncio.Lock())
-
-    async def consolidate_messages(self, messages: list[dict[str, object]]) -> bool:
-        """Archive a selected message chunk into persistent memory."""
-        return await self.store.consolidate(messages, self.provider, self.model)
-
-    def pick_consolidation_boundary(
-        self,
-        session: Session,
-        tokens_to_remove: int,
-    ) -> tuple[int, int] | None:
-        """Pick a user-turn boundary that removes enough old prompt tokens."""
-        start = session.last_consolidated
-        if start >= len(session.messages) or tokens_to_remove <= 0:
-            return None
-
-        removed_tokens = 0
-        last_boundary: tuple[int, int] | None = None
-        for idx in range(start, len(session.messages)):
-            message = session.messages[idx]
-            if idx > start and message.get("role") == "user":
-                last_boundary = (idx, removed_tokens)
-                if removed_tokens >= tokens_to_remove:
-                    return last_boundary
-            removed_tokens += estimate_message_tokens(message)
-
-        return last_boundary
-
-    def estimate_session_prompt_tokens(self, session: Session) -> tuple[int, str]:
-        """Estimate current prompt size for the normal session history view."""
-        history = session.get_history(max_messages=0)
-        channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
-        probe_messages = self._build_messages(
-            history=history,
-            current_message="[token-probe]",
-            channel=channel,
-            chat_id=chat_id,
-        )
-        return estimate_prompt_tokens_chain(
-            self.provider,
-            self.model,
-            probe_messages,
-            self._get_tool_definitions(),
-        )
-
-    async def archive_messages(self, messages: list[dict[str, object]]) -> bool:
-        """Archive messages with guaranteed persistence (retries until raw-dump fallback)."""
-        if not messages:
-            return True
-        for _ in range(self.store._MAX_FAILURES_BEFORE_RAW_ARCHIVE):
-            if await self.consolidate_messages(messages):
-                return True
-        return True
-
-    async def maybe_consolidate_by_tokens(self, session: Session) -> None:
-        """Loop: archive old messages until prompt fits within half the context window."""
-        if not session.messages or self.context_window_tokens <= 0:
-            return
-
-        lock = self.get_lock(session.key)
-        async with lock:
-            target = self.context_window_tokens // 2
-            estimated, source = self.estimate_session_prompt_tokens(session)
-            if estimated <= 0:
-                return
-            if estimated < self.context_window_tokens:
-                logger.debug(
-                    "Token consolidation idle {}: {}/{} via {}",
-                    session.key,
-                    estimated,
-                    self.context_window_tokens,
-                    source,
-                )
-                return
-
-            for round_num in range(self._MAX_CONSOLIDATION_ROUNDS):
-                if estimated <= target:
-                    return
-
-                boundary = self.pick_consolidation_boundary(session, max(1, estimated - target))
-                if boundary is None:
-                    logger.debug(
-                        "Token consolidation: no safe boundary for {} (round {})",
-                        session.key,
-                        round_num,
-                    )
-                    return
-
-                end_idx = boundary[0]
-                chunk = session.messages[session.last_consolidated:end_idx]
-                if not chunk:
-                    return
-
-                logger.info(
-                    "Token consolidation round {} for {}: {}/{} via {}, chunk={} msgs",
-                    round_num,
-                    session.key,
-                    estimated,
-                    self.context_window_tokens,
-                    source,
-                    len(chunk),
-                )
-                if not await self.consolidate_messages(chunk):
-                    return
-                session.last_consolidated = end_idx
-                self.sessions.save(session)
-
-                estimated, source = self.estimate_session_prompt_tokens(session)
-                if estimated <= 0:
-                    return
