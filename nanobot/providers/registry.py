@@ -81,6 +81,16 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         is_direct=True,
     ),
 
+    # === Responses API (OpenAI Responses API format, not Chat Completions) ======
+    ProviderSpec(
+        name="responses",
+        keywords=("responses-api",),
+        env_key="",
+        display_name="Responses API",
+        litellm_prefix="",
+        is_direct=True,
+    ),
+
     # === Azure OpenAI (direct API calls with API version 2024-10-21) =====
     ProviderSpec(
         name="azure_openai",

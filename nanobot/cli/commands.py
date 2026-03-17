@@ -383,6 +383,15 @@ def _make_provider(config: Config):
             default_model=model,
             extra_headers=p.extra_headers if p else None,
         )
+    # Responses API: OpenAI Responses API format (not Chat Completions)
+    elif provider_name == "responses":
+        from nanobot.providers.responses_provider import ResponsesAPIProvider
+        provider = ResponsesAPIProvider(
+            api_key=p.api_key if p else "no-key",
+            api_base=config.get_api_base(model) or "http://localhost:8000/v1",
+            default_model=model,
+            extra_headers=p.extra_headers if p else None,
+        )
     # Azure OpenAI: direct Azure OpenAI endpoint with deployment name
     elif provider_name == "azure_openai":
         if not p or not p.api_key or not p.api_base:
