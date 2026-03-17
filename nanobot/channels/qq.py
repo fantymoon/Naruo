@@ -1,30 +1,32 @@
 """QQ channel implementation using botpy SDK."""
-
+import random
 import asyncio
+import mimetypes
+import urllib.request
 from collections import deque
-from typing import TYPE_CHECKING, Any, Literal
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlparse
 
 from loguru import logger
 
 from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
-from nanobot.config.schema import Base
-from pydantic import Field
+from nanobot.config.schema import QQConfig
 
 try:
     import botpy
-    from botpy.message import C2CMessage, GroupMessage
+    from botpy.message import C2CMessage
 
     QQ_AVAILABLE = True
 except ImportError:
     QQ_AVAILABLE = False
     botpy = None
     C2CMessage = None
-    GroupMessage = None
 
 if TYPE_CHECKING:
-    from botpy.message import C2CMessage, GroupMessage
+    from botpy.message import C2CMessage
 
 
 def _make_bot_class(channel: "QQChannel") -> "type[botpy.Client]":
@@ -40,46 +42,25 @@ def _make_bot_class(channel: "QQChannel") -> "type[botpy.Client]":
             logger.info("QQ bot ready: {}", self.robot.name)
 
         async def on_c2c_message_create(self, message: "C2CMessage"):
-            await channel._on_message(message, is_group=False)
-
-        async def on_group_at_message_create(self, message: "GroupMessage"):
-            await channel._on_message(message, is_group=True)
+            await channel._on_message(message)
 
         async def on_direct_message_create(self, message):
-            await channel._on_message(message, is_group=False)
+            await channel._on_message(message)
 
     return _Bot
-
-
-class QQConfig(Base):
-    """QQ channel configuration using botpy SDK."""
-
-    enabled: bool = False
-    app_id: str = ""
-    secret: str = ""
-    allow_from: list[str] = Field(default_factory=list)
-    msg_format: Literal["plain", "markdown"] = "plain"
 
 
 class QQChannel(BaseChannel):
     """QQ channel using botpy SDK with WebSocket connection."""
 
     name = "qq"
-    display_name = "QQ"
 
-    @classmethod
-    def default_config(cls) -> dict[str, Any]:
-        return QQConfig().model_dump(by_alias=True)
-
-    def __init__(self, config: Any, bus: MessageBus):
-        if isinstance(config, dict):
-            config = QQConfig.model_validate(config)
+    def __init__(self, config: QQConfig, bus: MessageBus):
         super().__init__(config, bus)
         self.config: QQConfig = config
         self._client: "botpy.Client | None" = None
         self._processed_ids: deque = deque(maxlen=1000)
-        self._msg_seq: int = 1  # 消息序列号，避免被 QQ API 去重
-        self._chat_type_cache: dict[str, str] = {}
+        self._media_dir = Path.home() / ".nanobot" / "workspace" / "tmp" / "qq_media"
 
     async def start(self) -> None:
         """Start the QQ bot."""
@@ -94,7 +75,8 @@ class QQChannel(BaseChannel):
         self._running = True
         BotClass = _make_bot_class(self)
         self._client = BotClass()
-        logger.info("QQ bot started (C2C & Group supported)")
+
+        logger.info("QQ bot started (C2C private message)")
         await self._run_bot()
 
     async def _run_bot(self) -> None:
@@ -123,36 +105,72 @@ class QQChannel(BaseChannel):
         if not self._client:
             logger.warning("QQ client not initialized")
             return
-
         try:
             msg_id = msg.metadata.get("message_id")
-            self._msg_seq += 1
-            use_markdown = self.config.msg_format == "markdown"
-            payload: dict[str, Any] = {
-                "msg_type": 2 if use_markdown else 0,
-                "msg_id": msg_id,
-                "msg_seq": self._msg_seq,
-            }
-            if use_markdown:
-                payload["markdown"] = {"content": msg.content}
-            else:
-                payload["content"] = msg.content
-
-            chat_type = self._chat_type_cache.get(msg.chat_id, "c2c")
-            if chat_type == "group":
-                await self._client.api.post_group_message(
-                    group_openid=msg.chat_id,
-                    **payload,
-                )
-            else:
-                await self._client.api.post_c2c_message(
-                    openid=msg.chat_id,
-                    **payload,
-                )
+            msg_seq = random.randint(0, 1000000)
+            await self._client.api.post_c2c_message(
+                openid=msg.chat_id,
+                msg_type=0,
+                content=msg.content,
+                msg_id=msg_id,
+                msg_seq=msg_seq,
+            )
         except Exception as e:
             logger.error("Error sending QQ message: {}", e)
 
-    async def _on_message(self, data: "C2CMessage | GroupMessage", is_group: bool = False) -> None:
+    def _extract_image_urls(self, data: "C2CMessage") -> list[str]:
+        urls: list[str] = []
+        attachments = getattr(data, "attachments", None) or []
+        for item in attachments:
+            if isinstance(item, dict):
+                url = item.get("url") or item.get("proxy_url") or item.get("download_url")
+                content_type = item.get("content_type") or item.get("contentType") or ""
+                filename = item.get("filename") or ""
+            else:
+                url = getattr(item, "url", None) or getattr(item, "proxy_url", None) or getattr(item, "download_url", None)
+                content_type = getattr(item, "content_type", None) or getattr(item, "contentType", None) or ""
+                filename = getattr(item, "filename", None) or ""
+
+            if not url:
+                continue
+
+            lowered = f"{content_type} {filename} {url}".lower()
+            if "image" in lowered or any(ext in lowered for ext in (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp")):
+                urls.append(url)
+        return urls
+
+    def _download_media_sync(self, url: str, message_id: str, index: int) -> str | None:
+        try:
+            self._media_dir.mkdir(parents=True, exist_ok=True)
+            parsed = urlparse(url)
+            suffix = Path(parsed.path).suffix
+            req = urllib.request.Request(url, headers={"User-Agent": "nanobot/1.0"})
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                content_type = (resp.headers.get_content_type() or "").lower()
+                if not suffix:
+                    if content_type and content_type != "application/octet-stream":
+                        suffix = mimetypes.guess_extension(content_type) or ""
+                    if not suffix:
+                        guessed, _ = mimetypes.guess_type(url)
+                        suffix = mimetypes.guess_extension(guessed or "") or ".img"
+                target = self._media_dir / f"{message_id}_{index}{suffix}"
+                with open(target, "wb") as f:
+                    f.write(resp.read())
+            logger.info("QQ media downloaded: message_id={}, index={}, content_type={}, path={}", message_id, index, content_type or "unknown", target)
+            return str(target)
+        except Exception as e:
+            logger.warning("Failed to download QQ media {}: {}", url, e)
+            return None
+
+    async def _download_media(self, urls: list[str], message_id: str) -> list[str]:
+        files: list[str] = []
+        for i, url in enumerate(urls, start=1):
+            path = await asyncio.to_thread(self._download_media_sync, url, message_id, i)
+            if path:
+                files.append(path)
+        return files
+
+    async def _on_message(self, data: "C2CMessage") -> None:
         """Handle incoming message from QQ."""
         try:
             # Dedup by message ID
@@ -160,24 +178,27 @@ class QQChannel(BaseChannel):
                 return
             self._processed_ids.append(data.id)
 
+            author = data.author
+            user_id = str(getattr(author, 'id', None) or getattr(author, 'user_openid', 'unknown'))
             content = (data.content or "").strip()
-            if not content:
+            image_urls = self._extract_image_urls(data)
+            media_files = await self._download_media(image_urls, data.id) if image_urls else []
+            logger.info("QQ inbound message: id={}, has_text={}, image_urls={}, media_files={}", data.id, bool(content), len(image_urls), len(media_files))
+            if not content and media_files:
+                content = "[user sent an image]"
+            if not content and not media_files:
                 return
 
-            if is_group:
-                chat_id = data.group_openid
-                user_id = data.author.member_openid
-                self._chat_type_cache[chat_id] = "group"
-            else:
-                chat_id = str(getattr(data.author, 'id', None) or getattr(data.author, 'user_openid', 'unknown'))
-                user_id = chat_id
-                self._chat_type_cache[chat_id] = "c2c"
+            metadata: dict[str, Any] = {"message_id": data.id}
+            if image_urls:
+                metadata["qq_image_urls"] = image_urls
 
             await self._handle_message(
                 sender_id=user_id,
-                chat_id=chat_id,
+                chat_id=user_id,
                 content=content,
-                metadata={"message_id": data.id},
+                media=media_files,
+                metadata=metadata,
             )
         except Exception:
             logger.exception("Error handling QQ message")
